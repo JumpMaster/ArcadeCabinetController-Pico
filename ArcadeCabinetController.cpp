@@ -1,4 +1,5 @@
-
+#include <EasyButton.h>
+#include <Sequence.h>
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 
@@ -29,19 +30,20 @@ const uint8_t PI_POWEROFF_PIN = 15;
 const uint8_t PLAYER1_BUTTON_INPUT_PIN = 16;
 const uint8_t PLAYER1_BUTTON_OUTPUT_PIN = 17;
 
-bool player1ButtonState = HIGH;
-uint32_t player1ButtonStateChangeTime = 0;
+bool player1ButtonState;
+//EasyButton player1Button(PLAYER1_BUTTON_INPUT_PIN, debounce, pullup, invert);
+EasyButton player1Button(PLAYER1_BUTTON_INPUT_PIN, 35, true, true);
 
-const uint8_t relay_PIN1 = 18;
-const uint8_t relay_PIN2 = 19;
-const uint8_t relay_PIN3 = 20;
+const uint8_t relay_PIN1 = 18; // 240V - Pi and Screen
+const uint8_t relay_PIN2 = 19; // 12V - LEDs and Amplifier
+const uint8_t relay_PIN3 = 20; // 5V - Unused due to noisy PSU affecting Pi audio
 const uint8_t relay_PIN4 = 21;
 
 uint32_t lastPowerChange = 0;
 bool startupComplete = false;
 
 uint32_t nextBrightnessChange = 0;
-const uint8_t brightnessDelay = 10; // Milliseconds
+const uint8_t brightnessDelay = 10; // Milliseconds between brightness changes
 
 Adafruit_NeoPixel pixels(NUMPIXELS, LED_STRIP_PIN, NEO_RGB + NEO_KHZ800);
 
@@ -146,8 +148,9 @@ void setup()
 {
     pinMode(ONBOARD_LED_PIN, OUTPUT);
     pinMode(PI_POWEROFF_PIN, INPUT_PULLDOWN);
-    pinMode(PLAYER1_BUTTON_INPUT_PIN, INPUT_PULLUP);
     pinMode(PLAYER1_BUTTON_OUTPUT_PIN, OUTPUT);
+
+    player1Button.begin();
 
     pinMode(relay_PIN1, OUTPUT);
     pinMode(relay_PIN2, OUTPUT);
@@ -200,14 +203,22 @@ void loop()
     }
 
     // MANAGE PLAYER 1 START BUTTON
-    if (player1ButtonState != digitalRead(PLAYER1_BUTTON_INPUT_PIN))
-    {
-        player1ButtonStateChangeTime = millis();
-        player1ButtonState = !player1ButtonState;
+    player1Button.read();
 
-        if (cabinetPowerState == HIGH)
-            digitalWrite(PLAYER1_BUTTON_OUTPUT_PIN, !player1ButtonState);
-        else if (cabinetPowerState == LOW && player1ButtonState == LOW && millis() > (lastPowerChange + 500))
+    if (cabinetPowerState == HIGH)
+    {
+        if (player1Button.isPressed() != player1ButtonState)
+        {
+            player1ButtonState = player1Button.isPressed();
+            digitalWrite(PLAYER1_BUTTON_OUTPUT_PIN, player1ButtonState ? HIGH : LOW);
+        }
+
+        if (player1Button.pressedFor(10000))
+            cabinetTargetPowerState = LOW;
+    }
+    else if (cabinetPowerState == LOW)
+    {
+        if (player1Button.pressedFor(1000) && !player1Button.pressedFor(10000))
             cabinetTargetPowerState = HIGH;
     }
 

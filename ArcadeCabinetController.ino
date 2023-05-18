@@ -1,82 +1,4 @@
-#include "secrets.h"
-#include <Wire.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
-#include "PapertrailLogger.h"
-#include <Adafruit_NeoPixel.h>
-#include <PubSubClient.h>
-#include "HAMqttDevice.h"
-#include <EasyButton.h>
-
-typedef enum
-{
-    LIGHT_MODE_OFF = 0,
-    LIGHT_MODE_SOLID = 1,
-    LIGHT_MODE_RAINBOW = 2,
-    LIGHT_MODE_RAINBOW_SOLID = 3,
-    LIGHT_MODE_MANUAL = 4,
-} LightMode;
-
-enum
-{
-    i2c_LIGHT_BRIGHTNESS = 0x01,
-    i2c_LIGHT_COLOR = 0x02,
-    i2c_LIGHT_MODE = 0x10,
-    i2c_LIGHT_MANUAL = 0x20,
-    i2c_LIGHT_OFF = 0xFF,
-};
-
-const uint8_t NUMPIXELS = 34;
-const uint8_t ONBOARD_LED_PIN = LED_BUILTIN;
-
-const uint8_t LED_STRIP_PIN = 13;
-const uint8_t PI_SHUTDOWN_PIN = 14;
-const uint8_t PI_POWEROFF_PIN = 15;
-const uint8_t PLAYER1_BUTTON_INPUT_PIN = 16;
-const uint8_t PLAYER1_BUTTON_OUTPUT_PIN = 17;
-
-bool player1ButtonState;
-//EasyButton player1Button(PLAYER1_BUTTON_INPUT_PIN, debounce, pullup, invert);
-EasyButton player1Button(PLAYER1_BUTTON_INPUT_PIN, 35, true, true);
-
-const uint8_t relay_PIN1 = 18; // 240V - Pi and Screen
-const uint8_t relay_PIN2 = 19; // 12V  - Amplifier
-const uint8_t relay_PIN3 = 20; // 12V  - LEDs
-const uint8_t relay_PIN4 = 21; // 5V   - Unused due to noisy PSU affecting Pi audio
-
-bool ledPowerState = LOW;
-
-bool startupComplete = false;
-
-Adafruit_NeoPixel pixels(NUMPIXELS, LED_STRIP_PIN, NEO_RGB + NEO_KHZ800);
-
-LightMode lightMode = LIGHT_MODE_OFF;
-uint8_t lightBrightness = 0;
-uint8_t lightTargetBrightness = 255;
-uint32_t nextBrightnessChange = 0;
-const uint8_t brightnessDelay = 10; // Milliseconds between brightness changes
-uint8_t lightColor[3] = {255, 255, 255};
-uint8_t manualLEDColor[3] = {255, 255, 255};
-uint8_t manualLEDPosition = 0;
-
-PapertrailLogger *infoLog;
-WiFiClient rpiClient;
-PubSubClient mqttClient(rpiClient);
-unsigned long wifiReconnectPreviousMillis = 0;
-unsigned long wifiReconnectInterval = 30000;
-
-const char* deviceConfig = "{\"identifiers\":\"be6beb17-0012-4a70-bc76-a484d34de5cb\",\"name\":\"ArcadeCabinet\",\"sw_version\":\"0.2\",\"model\":\"ArcadeCabinet\",\"manufacturer\":\"JumpMaster\"}";
-
-HAMqttDevice mqttPowerButton("ArcadeCabinet Power Button", HAMqttDevice::BUTTON, "homeassistant");
-HAMqttDevice mqttPowerState("ArcadeCabinet Power State", HAMqttDevice::BINARY_SENSOR, "homeassistant");
-HAMqttDevice mqttParentalMode("ArcadeCabinet Parental Mode", HAMqttDevice::SWITCH, "homeassistant");
-
-bool parentalMode = false;
-bool cabinetPowerState = LOW;
-bool cabinetTargetPowerState = LOW;
-
-uint32_t currentMillis = 0;
+#include "ArcadeCabinetController.h"
 
 void setCabinetPower(bool newState)
 {
@@ -96,6 +18,22 @@ void setCabinetPower(bool newState)
     }
 }
 
+void sendTelegrafMetrics()
+{
+    uint32_t uptime = rp2040.getCycleCount64() / F_CPU; //133000000L;
+
+    char buffer[150];
+
+    snprintf(buffer, sizeof(buffer),
+        "status,device=%s uptime=%ld,memUsed=%ld,memTotal=%ld,firmware=\"%s\"",
+        deviceName,
+        uptime,
+        rp2040.getUsedHeap(),
+        rp2040.getTotalHeap(),
+        ARDUINO_PICO_VERSION_STR);
+    mqttClient.publish("telegraf/particle", buffer);
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
     char data[length + 1];
@@ -106,12 +44,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
     {
         if (strcmp(data, "PRESS") == 0)
         {
-            infoLog->println("Virtual power button pressed");
+            Log.println("Virtual power button pressed");
             mqttClient.publish("log/mqttCallback", "Virtual power button pressed");
             if (cabinetPowerState == LOW)
             {   // Power on
                 cabinetTargetPowerState = HIGH;
-                infoLog->println("Cabinet power on initiated");
+                Log.println("Cabinet power on initiated");
                 mqttClient.publish("log/mqttCallback", "Cabinet power on initiated");
             }
             else
@@ -119,7 +57,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
                 digitalWrite(PI_SHUTDOWN_PIN, HIGH);
                 delay(200);
                 digitalWrite(PI_SHUTDOWN_PIN, LOW);
-                infoLog->println("Cabinet shutdown initiated");
+                Log.println("Cabinet shutdown initiated");
                 mqttClient.publish("log/mqttCallback", "Cabinet shutdown initiated");
             }
         }
@@ -138,20 +76,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
            parentalMode = false;
         }
         mqttClient.publish(mqttParentalMode.getStateTopic().c_str(), data, true);
-        infoLog->printf("Parental mode turned %s\n", parentalMode ? "on" : "off");
+        Log.printf("Parental mode turned %s\n", parentalMode ? "on" : "off");
     }
 }
 
 void mqttConnect()
 {
     // Loop until we're reconnected
-    while (!mqttClient.connected())
-    {
-        infoLog->println("Connecting to MQTT");
+    // while (!mqttClient.connected())
+    // {
+        Log.println("Connecting to MQTT");
         // Attempt to connect
         if (mqttClient.connect(deviceName, mqtt_username, mqtt_password))
         {
-            infoLog->println("Connected to MQTT");
+            Log.println("Connected to MQTT");
+            nextMqttConnectAttempt = 0;
 
             mqttClient.publish(mqttPowerButton.getConfigTopic().c_str(), mqttPowerButton.getConfigPayload().c_str(), true);
             mqttClient.publish(mqttPowerState.getConfigTopic().c_str(), mqttPowerState.getConfigPayload().c_str(), true);
@@ -166,26 +105,22 @@ void mqttConnect()
         }
         else
         {
-            infoLog->println("Failed to connect to MQTT");
-            return;
+            Log.println("Failed to connect to MQTT");
+            nextMqttConnectAttempt = millis() + mqttReconnectInterval;
+            // return;
             // Wait 5 seconds before retrying
-            delay(5000);
+            // delay(5000);
         }
-    }
+    // }
 }
 
 void connectToNetwork()
 {
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSSID, wifiPassword);
- 
-    while (WiFi.waitForConnectResult() != WL_CONNECTED)
-    {
-        delay(1000);
-    }
 
-    if (WiFi.status() == WL_CONNECTED)
-        infoLog->println("Connected to WiFi");
+    if (WiFi.waitForConnectResult() == WL_CONNECTED && wifiReconnectCount == 0)
+        Log.println("Connected to WiFi");
 }
 
 void setupMQTT()
@@ -208,7 +143,7 @@ void setupPixels()
 
 void setupOTA()
 {
-    ArduinoOTA.setHostname(deviceName);
+    //ArduinoOTA.setHostname(deviceName);
   
     ArduinoOTA.onStart([]()
     {
@@ -367,8 +302,6 @@ void setup()
     pinMode(PLAYER1_BUTTON_OUTPUT_PIN, OUTPUT);
     pinMode(PI_SHUTDOWN_PIN, OUTPUT);
 
-    player1Button.begin();
-
     pinMode(relay_PIN1, OUTPUT);
     pinMode(relay_PIN2, OUTPUT);
     pinMode(relay_PIN3, OUTPUT);
@@ -382,15 +315,14 @@ void setup()
     digitalWrite(relay_PIN3, LOW);
     digitalWrite(relay_PIN4, LOW);
 
+    Log.setup();
+
     setupMQTT();
 
     //Wire.setClock(19000); // Works 9/10 times with the host set to 10000
     Wire.begin(0x0a);
     Wire.onReceive(i2cReceiveData);
     Wire.onRequest(i2cSendData);
-
-    infoLog = new PapertrailLogger(papertrailAddress, papertrailPort, LogLevel::Info, WiFi.macAddress(), deviceName);
-
     setupPixels();
 
     connectToNetwork();
@@ -398,6 +330,11 @@ void setup()
     setupOTA();
 
     mqttConnect();
+}
+
+void setup1()
+{
+    player1Button.begin();
 }
 
 void manageOnboardLED()
@@ -416,58 +353,96 @@ void manageOnboardLED()
 void manageWiFi()
 {
     // if WiFi is down, try reconnecting
-    if ((WiFi.status() != WL_CONNECTED) && (currentMillis - wifiReconnectPreviousMillis >= wifiReconnectInterval))
+    if ((WiFi.status() != WL_CONNECTED) && (millis() - wifiReconnectPreviousMillis >= wifiReconnectInterval))
     {
-        //Serial.print(currentMillis);
-        //Serial.println("Reconnecting to WiFi...");
-        WiFi.disconnect();
+        if (wifiReconnectCount >= 10)
+        {
+            rp2040.restart();
+        }
+        
+        wifiReconnectCount++;
 
-        //WiFi.reconnect();
         connectToNetwork();
 
         if (WiFi.status() == WL_CONNECTED)
-            infoLog->println("Reconnected to WiFi");
-
-        wifiReconnectPreviousMillis = currentMillis;
+        {
+            wifiReconnectCount = 0;
+            wifiReconnectPreviousMillis = 0;
+            Log.println("Reconnected to WiFi");
+        }
+        else
+        {
+          wifiReconnectPreviousMillis = millis();
+        }
     }
 }
 
 void manageMQTT()
 {
+    /*
     if (!mqttClient.connected())
     {
         mqttConnect();
     }
     else
     {
+        */
+    if (mqttClient.connected())
+    {
         mqttClient.loop();
+
+        if (millis() > nextMetricsUpdate)
+        {
+            sendTelegrafMetrics();
+            nextMetricsUpdate = millis() + 30000;
+        }
+    } else if (millis() > nextMqttConnectAttempt)
+    {
+        mqttConnect();
     }
 }
 
-void managePowerStates()
+void managePowerState()
 {
     // DETECT PI POWEROFF - dtoverlay=gpio-poweroff
     if (cabinetPowerState == HIGH && digitalRead(PI_POWEROFF_PIN) == HIGH)
         cabinetTargetPowerState = LOW;
-  
+ 
     // MANAGE POWER STATES
     if (cabinetTargetPowerState != cabinetPowerState)
     {
         if (cabinetTargetPowerState == HIGH)
         {
             setCabinetPower(HIGH);
-            lightMode = LIGHT_MODE_RAINBOW;
         }
         else if (cabinetTargetPowerState == LOW)
         {
             setCabinetPower(LOW);
+        }
+    }
+}
+
+void reportPowerState()
+{
+
+    // MANAGE POWER STATES
+    if (reportedPowerState != cabinetPowerState)
+    {
+        if (cabinetPowerState == HIGH)
+        {
+            lightMode = LIGHT_MODE_RAINBOW;
+        }
+        else if (cabinetPowerState == LOW)
+        {
             lightMode = LIGHT_MODE_OFF;
         }
+
+        reportedPowerState = cabinetPowerState;
 
         if (mqttClient.connected())
             mqttClient.publish(mqttPowerState.getStateTopic().c_str(), cabinetPowerState ? "ON" : "OFF", true);
     
-        infoLog->printf("Cabinet powering %s\n", cabinetTargetPowerState ? "on" : "off");
+        Log.printf("Cabinet powering %s\n", cabinetTargetPowerState ? "on" : "off");
     }
 }
 
@@ -482,10 +457,10 @@ void manageStartButton()
         {
             player1ButtonState = player1Button.isPressed();
             digitalWrite(PLAYER1_BUTTON_OUTPUT_PIN, player1ButtonState ? HIGH : LOW);
-
-            if (player1Button.pressedFor(10000))
-                cabinetTargetPowerState = LOW;
         }
+
+        if (player1Button.pressedFor(10000))
+            cabinetTargetPowerState = LOW;
     }
     else if (!parentalMode && cabinetPowerState == LOW)
     {
@@ -583,8 +558,6 @@ void manageLEDs()
 
 void loop()
 {
-    currentMillis = millis();
-
     ArduinoOTA.handle();
 
     manageWiFi();
@@ -593,9 +566,14 @@ void loop()
 
     manageOnboardLED();
 
-    managePowerStates();
+    manageLEDs();
+
+    reportPowerState();
+}
+
+void loop1()
+{
+    managePowerState();
 
     manageStartButton();
-
-    manageLEDs();
 }
